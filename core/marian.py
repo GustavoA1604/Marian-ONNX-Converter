@@ -5,8 +5,8 @@ import torch.nn.functional as F
 
 from transformers import MarianConfig
 
-from transformers.generation_utils import GenerationMixin
-from transformers.generation_logits_process import LogitsProcessor
+from transformers.generation.utils import GenerationMixin
+from transformers.generation.logits_process import LogitsProcessor
 
 from core.utils import create_model_for_provider
 

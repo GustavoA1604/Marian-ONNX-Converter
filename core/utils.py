@@ -2,6 +2,7 @@ import os
 import shutil
 
 import torch
+import numpy as np
 
 from transformers import MarianMTModel, MarianTokenizer
 
@@ -34,6 +35,19 @@ def create_model_for_provider(path: str, provider: str):
     return session
 
 
+def save_tensor_as_raw_binary(tensor, filepath):
+    """Save a PyTorch tensor as raw binary file for C++ memory mapping
+    
+    Args:
+        tensor: PyTorch tensor to save
+        filepath: Path where to save the raw binary file
+    """
+    tensor_np = tensor.detach().cpu().numpy().astype(np.float32)
+    if len(tensor_np.shape) > 1 and tensor_np.shape[0] == 1:
+        tensor_np = tensor_np.flatten()
+    tensor_np.tofile(filepath)
+
+
 def create_marian_encoder_decoder(model_path: str, outdir: str):
     """Create a MarianMTModel encoder & decoder
 
@@ -53,6 +67,10 @@ def create_marian_encoder_decoder(model_path: str, outdir: str):
 
     torch.save(model.model.shared.weight, os.path.join(outdir, 'lm_weight.bin'))
     torch.save(model.final_logits_bias, os.path.join(outdir, 'lm_bias.bin'))
+    
+    print("Saving raw binary weights for C++ compatibility...")
+    save_tensor_as_raw_binary(model.model.shared.weight, os.path.join(outdir, 'lm_weight_raw.bin'))
+    save_tensor_as_raw_binary(model.final_logits_bias, os.path.join(outdir, 'lm_bias_raw.bin'))
 
     for file in ['config.json', 'source.spm', 'target.spm', 'tokenizer_config.json', 'vocab.json']:
         shutil.copyfile(os.path.join(model_path, file), os.path.join(outdir, file))
@@ -70,7 +88,7 @@ def generate_onnx_graph(model_path, encoder_path, decoder_path, outdir, quant=Tr
 
     print("Exporting encoder to ONNX...")
     # Exports to ONNX
-    torch.onnx._export(
+    torch.onnx.export(
         encoder,
         (input_ids, attention_mask),
         encoder_path,
@@ -89,12 +107,12 @@ def generate_onnx_graph(model_path, encoder_path, decoder_path, outdir, quant=Tr
 
     print("Exporting decoder to ONNX...")
     encoder_hidden_states = encoder(input_ids, attention_mask)[0]
-    torch.onnx._export(
+    torch.onnx.export(
         decoder,
         (input_ids, encoder_hidden_states, attention_mask),
         decoder_path,
         export_params=True,
-        opset_version=12,
+        opset_version=14,
         input_names=["input_ids", "encoder_hidden_states", "attention_mask"],
         output_names=["decoder_output"],
         dynamic_axes={

@@ -2,7 +2,6 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
-import shutil
 import argparse
 
 from core.utils import generate_onnx_graph
@@ -36,8 +35,6 @@ def main():
     except Exception as e:
         print(e)
 
-    print("Creating archive file...")
-    shutil.make_archive(outdir, format="zip", root_dir=outdir)
     print("Done.")
 
 
