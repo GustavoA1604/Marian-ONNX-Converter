@@ -53,6 +53,10 @@ std::vector<std::string> splitIntoSentences(const std::string &text) {
             sentences.push_back(trimmed);
         }
     }
+
+    if (sentences.empty()) {
+        throw std::runtime_error("No sentences found in input text");
+    }
     
     return sentences;
 }
@@ -121,48 +125,23 @@ int main(int argc, char *argv[]) {
         }
 
         const std::string modelDir = "../outs/";
-        std::cout << "\n=== INITIALIZING TRANSLATION MODEL ===" << std::endl;
-        std::cout << "Model directory: " << modelDir << std::endl;
-        std::cout << "Model type: English → Italian" << std::endl;
         std::cout << "Input text: \"" << inputText << "\"" << std::endl;
-        std::cout << "Translation mode: " << (useSingleMode ? "Single" : "Batch") << std::endl;
 
         TranslationModel model(modelDir);
         
         std::string finalResult;
 
         if (useSingleMode) {
-            std::cout << "\n=== SINGLE SENTENCE MODE ===" << std::endl;
             finalResult = model.translateSingle(inputText);
-        } else {
-            std::cout << "\n=== BATCH TRANSLATION MODE ===" << std::endl;
-            
-            std::cout << "\n--- Sentence Splitting ---" << std::endl;
-            std::cout << "Input text: \"" << inputText << "\"" << std::endl;
-            
+        } else {            
             std::vector<std::string> sentences = splitIntoSentences(inputText);
-            
-            if (sentences.empty()) {
-                throw std::runtime_error("No sentences found in input text");
-            }
-            
-            std::cout << "Found " << sentences.size() << " sentence(s):" << std::endl;
-            for (size_t i = 0; i < sentences.size(); ++i) {
-                std::cout << "  " << i + 1 << ": \"" << sentences[i] << "\"" << std::endl;
-            }
-            
             std::vector<std::string> translations = model.translate(sentences);
-            
-            std::cout << "\n--- Combining Translations ---" << std::endl;
             finalResult = joinSentences(translations);
         }
         
-        std::cout << "\n=== FINAL RESULT ===" << std::endl;
-        std::cout << "Original: \"" << inputText << "\"" << std::endl;
-        std::cout << "Translation: \"" << finalResult << "\"" << std::endl;
+        std::cout << "\nOutput: \"" << finalResult << "\"" << std::endl;
         
         return 0;
-
     } catch (const std::exception &e) {
         std::cerr << "\nError: " << e.what() << std::endl;
         std::cerr << "Please check that:" << std::endl;

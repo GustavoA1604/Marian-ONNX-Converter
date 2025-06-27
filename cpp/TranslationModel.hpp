@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -9,7 +10,6 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -48,19 +48,12 @@ class MemoryMappedWeights {
     size_t size_;
 };
 
-void computeLogitsOptimized(const std::vector<float> &hiddenState,
-                            const MemoryMappedWeights &weights,
-                            const MemoryMappedWeights &bias,
-                            std::vector<float> &logits,
-                            int vocabSize,
-                            int hiddenSize);
-
-void computeBatchedLogitsOptimized(const std::vector<std::vector<float>> &hiddenStates,
-                                   const MemoryMappedWeights &weights,
-                                   const MemoryMappedWeights &bias,
-                                   std::vector<std::vector<float>> &batchLogits,
-                                   int vocabSize,
-                                   int hiddenSize);
+void computeLogits(const std::vector<float> &hiddenState,
+                   const MemoryMappedWeights &weights,
+                   const MemoryMappedWeights &bias,
+                   std::vector<float> &logits,
+                   int vocabSize,
+                   int hiddenSize);
 
 #ifdef USE_SIMD
 void computeLogitsSimd(const std::vector<float> &hiddenState,
@@ -69,26 +62,12 @@ void computeLogitsSimd(const std::vector<float> &hiddenState,
                        std::vector<float> &logits,
                        int vocabSize,
                        int hiddenSize);
-
-void computeBatchedLogitsSimd(const std::vector<std::vector<float>> &hiddenStates,
-                              const MemoryMappedWeights &weights,
-                              const MemoryMappedWeights &bias,
-                              std::vector<std::vector<float>> &batchLogits,
-                              int vocabSize,
-                              int hiddenSize);
-
-void computeBatchedLogitsSimdUltra(const std::vector<std::vector<float>> &hiddenStates,
-                                   const MemoryMappedWeights &weights,
-                                   const MemoryMappedWeights &bias,
-                                   std::vector<std::vector<float>> &batchLogits,
-                                   int vocabSize,
-                                   int hiddenSize);
 #endif
 
 class TranslationModel {
   public:
     explicit TranslationModel(const std::string &modelDir);
-    
+
     std::vector<std::string> translate(const std::vector<std::string> &sentences);
     std::string translateSingle(const std::string &inputSentence);
 
@@ -132,11 +111,10 @@ class TranslationModel {
 
     std::vector<int> tokenize(const std::string &sentence);
     std::string detokenize(const std::vector<int> &ids);
-    
+
     BatchedInputs createBatch(const std::vector<std::string> &sentences);
     BatchedEncoderOutput runBatchedEncoder(const BatchedInputs &batch);
-    std::vector<std::vector<int>> runBatchedDecoder(const BatchedEncoderOutput &encoderOutput, 
-                                                   const BatchedInputs &batchInputs);
+    std::vector<std::vector<int>> runBatchedDecoder(const BatchedEncoderOutput &encoderOutput, const BatchedInputs &batchInputs);
 
     std::vector<float> runEncoder(const std::vector<int> &tokenIds);
     std::vector<float> runDecoderStep(const std::vector<int64_t> &decoderInputIds,
@@ -144,6 +122,5 @@ class TranslationModel {
                                       const std::vector<int64_t> &attentionMask,
                                       const std::vector<int64_t> &decoderShape,
                                       const std::vector<int64_t> &encoderShape);
-    std::vector<int> runDecoder(const std::vector<float> &encoderOutput, 
-                               const std::vector<int64_t> &attentionMask);
-}; 
+    std::vector<int> runDecoder(const std::vector<float> &encoderOutput, const std::vector<int64_t> &attentionMask);
+};

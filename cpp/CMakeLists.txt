@@ -43,7 +43,10 @@ if(NOT SENTENCEPIECE_FOUND)
 endif()
 
 # Create executable
-add_executable(main main.cpp)
+add_executable(main 
+    main.cpp 
+    TranslationModel.cpp
+)
 
 # Include directories (matching the -I flags from g++ command)
 target_include_directories(main PRIVATE 
