@@ -48,22 +48,6 @@ class MemoryMappedWeights {
     size_t size_;
 };
 
-void computeLogits(const std::vector<float> &hiddenState,
-                   const MemoryMappedWeights &weights,
-                   const MemoryMappedWeights &bias,
-                   std::vector<float> &logits,
-                   int vocabSize,
-                   int hiddenSize);
-
-#ifdef USE_SIMD
-void computeLogitsSimd(const std::vector<float> &hiddenState,
-                       const MemoryMappedWeights &weights,
-                       const MemoryMappedWeights &bias,
-                       std::vector<float> &logits,
-                       int vocabSize,
-                       int hiddenSize);
-#endif
-
 class TranslationModel {
   public:
     explicit TranslationModel(const std::string &modelDir);
@@ -99,6 +83,29 @@ class TranslationModel {
     Ort::SessionOptions sessionOptions_;
     std::unique_ptr<Ort::Session> encoderSession_;
     std::unique_ptr<Ort::Session> decoderSession_;
+
+    struct SessionInfo {
+        std::vector<std::string> inputNames;
+        std::vector<std::string> outputNames;
+        std::vector<const char*> inputNamePtrs;
+        std::vector<const char*> outputNamePtrs;
+        
+        void updatePointers() {
+            inputNamePtrs.clear();
+            outputNamePtrs.clear();
+            for (const auto& name : inputNames) {
+                inputNamePtrs.push_back(name.c_str());
+            }
+            for (const auto& name : outputNames) {
+                outputNamePtrs.push_back(name.c_str());
+            }
+        }
+    };
+    
+    Ort::AllocatorWithDefaultOptions allocator_;
+    Ort::MemoryInfo memoryInfo_;
+    SessionInfo encoderInfo_;
+    SessionInfo decoderInfo_;
 
     sentencepiece::SentencePieceProcessor spProcessor_;
     std::string modelDir_;

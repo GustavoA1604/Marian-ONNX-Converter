@@ -82,6 +82,90 @@ std::string decodeJsonEscapes(const std::string &input) {
     return result;
 }
 
+void computeLogits(const std::vector<float> &hiddenState,
+                   const MemoryMappedWeights &weights,
+                   const MemoryMappedWeights &bias,
+                   std::vector<float> &logits,
+                   int vocabSize,
+                   int hiddenSize) {
+
+    const float *hiddenPtr = hiddenState.data();
+    const float *weightsPtr = weights.getAlignedPtr();
+    const float *biasPtr = bias.getAlignedPtr();
+
+    constexpr int BLOCK_SIZE = 64;
+
+    for (int blockStart = 0; blockStart < vocabSize; blockStart += BLOCK_SIZE) {
+        int blockEnd = std::min(blockStart + BLOCK_SIZE, vocabSize);
+
+        if (blockEnd < vocabSize) {
+            weights.prefetchRange(blockEnd * hiddenSize, BLOCK_SIZE * hiddenSize);
+            bias.prefetchRange(blockEnd, BLOCK_SIZE);
+        }
+
+        for (int i = blockStart; i < blockEnd; ++i) {
+            const float *weightRow = weightsPtr + i * hiddenSize;
+
+            float sum = biasPtr[i];
+
+            int j = 0;
+            for (; j <= hiddenSize - 8; j += 8) {
+                sum += hiddenPtr[j] * weightRow[j];
+                sum += hiddenPtr[j + 1] * weightRow[j + 1];
+                sum += hiddenPtr[j + 2] * weightRow[j + 2];
+                sum += hiddenPtr[j + 3] * weightRow[j + 3];
+                sum += hiddenPtr[j + 4] * weightRow[j + 4];
+                sum += hiddenPtr[j + 5] * weightRow[j + 5];
+                sum += hiddenPtr[j + 6] * weightRow[j + 6];
+                sum += hiddenPtr[j + 7] * weightRow[j + 7];
+            }
+
+            for (; j < hiddenSize; ++j) {
+                sum += hiddenPtr[j] * weightRow[j];
+            }
+
+            logits[i] = sum;
+        }
+    }
+}
+
+#ifdef USE_SIMD
+void computeLogitsSimd(const std::vector<float> &hiddenState,
+                       const MemoryMappedWeights &weights,
+                       const MemoryMappedWeights &bias,
+                       std::vector<float> &logits,
+                       int vocabSize,
+                       int hiddenSize) {
+
+    const float *hiddenPtr = hiddenState.data();
+    const float *weightsPtr = weights.getAlignedPtr();
+    const float *biasPtr = bias.getAlignedPtr();
+
+    for (int i = 0; i < vocabSize; ++i) {
+        const float *weightRow = weightsPtr + i * hiddenSize;
+
+        __m256 sumVec = _mm256_setzero_ps();
+
+        int j = 0;
+        for (; j <= hiddenSize - 8; j += 8) {
+            __m256 hiddenVec = _mm256_loadu_ps(&hiddenPtr[j]);
+            __m256 weightVec = _mm256_loadu_ps(&weightRow[j]);
+            sumVec = _mm256_fmadd_ps(hiddenVec, weightVec, sumVec);
+        }
+
+        float sumArray[8];
+        _mm256_storeu_ps(sumArray, sumVec);
+        float sum = sumArray[0] + sumArray[1] + sumArray[2] + sumArray[3] + sumArray[4] + sumArray[5] + sumArray[6] + sumArray[7];
+
+        for (; j < hiddenSize; ++j) {
+            sum += hiddenPtr[j] * weightRow[j];
+        }
+
+        logits[i] = sum + biasPtr[i];
+    }
+}
+#endif
+
 MemoryMappedWeights::MemoryMappedWeights(const std::string &path) : fd_(-1), data_(nullptr), size_(0) {
     fd_ = open(path.c_str(), O_RDONLY);
     if (fd_ == -1) {
@@ -176,91 +260,10 @@ inline const float *MemoryMappedWeights::getAlignedPtr(size_t offset) const {
     return data_ + offset;
 }
 
-void computeLogits(const std::vector<float> &hiddenState,
-                   const MemoryMappedWeights &weights,
-                   const MemoryMappedWeights &bias,
-                   std::vector<float> &logits,
-                   int vocabSize,
-                   int hiddenSize) {
-
-    const float *hiddenPtr = hiddenState.data();
-    const float *weightsPtr = weights.getAlignedPtr();
-    const float *biasPtr = bias.getAlignedPtr();
-
-    constexpr int BLOCK_SIZE = 64;
-
-    for (int blockStart = 0; blockStart < vocabSize; blockStart += BLOCK_SIZE) {
-        int blockEnd = std::min(blockStart + BLOCK_SIZE, vocabSize);
-
-        if (blockEnd < vocabSize) {
-            weights.prefetchRange(blockEnd * hiddenSize, BLOCK_SIZE * hiddenSize);
-            bias.prefetchRange(blockEnd, BLOCK_SIZE);
-        }
-
-        for (int i = blockStart; i < blockEnd; ++i) {
-            const float *weightRow = weightsPtr + i * hiddenSize;
-
-            float sum = biasPtr[i];
-
-            int j = 0;
-            for (; j <= hiddenSize - 8; j += 8) {
-                sum += hiddenPtr[j] * weightRow[j];
-                sum += hiddenPtr[j + 1] * weightRow[j + 1];
-                sum += hiddenPtr[j + 2] * weightRow[j + 2];
-                sum += hiddenPtr[j + 3] * weightRow[j + 3];
-                sum += hiddenPtr[j + 4] * weightRow[j + 4];
-                sum += hiddenPtr[j + 5] * weightRow[j + 5];
-                sum += hiddenPtr[j + 6] * weightRow[j + 6];
-                sum += hiddenPtr[j + 7] * weightRow[j + 7];
-            }
-
-            for (; j < hiddenSize; ++j) {
-                sum += hiddenPtr[j] * weightRow[j];
-            }
-
-            logits[i] = sum;
-        }
-    }
-}
-
-#ifdef USE_SIMD
-void computeLogitsSimd(const std::vector<float> &hiddenState,
-                       const MemoryMappedWeights &weights,
-                       const MemoryMappedWeights &bias,
-                       std::vector<float> &logits,
-                       int vocabSize,
-                       int hiddenSize) {
-
-    const float *hiddenPtr = hiddenState.data();
-    const float *weightsPtr = weights.getAlignedPtr();
-    const float *biasPtr = bias.getAlignedPtr();
-
-    for (int i = 0; i < vocabSize; ++i) {
-        const float *weightRow = weightsPtr + i * hiddenSize;
-
-        __m256 sumVec = _mm256_setzero_ps();
-
-        int j = 0;
-        for (; j <= hiddenSize - 8; j += 8) {
-            __m256 hiddenVec = _mm256_loadu_ps(&hiddenPtr[j]);
-            __m256 weightVec = _mm256_loadu_ps(&weightRow[j]);
-            sumVec = _mm256_fmadd_ps(hiddenVec, weightVec, sumVec);
-        }
-
-        float sumArray[8];
-        _mm256_storeu_ps(sumArray, sumVec);
-        float sum = sumArray[0] + sumArray[1] + sumArray[2] + sumArray[3] + sumArray[4] + sumArray[5] + sumArray[6] + sumArray[7];
-
-        for (; j < hiddenSize; ++j) {
-            sum += hiddenPtr[j] * weightRow[j];
-        }
-
-        logits[i] = sum + biasPtr[i];
-    }
-}
-#endif
-
-TranslationModel::TranslationModel(const std::string &modelDir) : modelDir_(modelDir), env_(ORT_LOGGING_LEVEL_WARNING, "MarianTranslationModel") {
+TranslationModel::TranslationModel(const std::string &modelDir) 
+    : modelDir_(modelDir), 
+      env_(ORT_LOGGING_LEVEL_WARNING, "MarianTranslationModel"),
+      memoryInfo_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
     vocab_ = loadVocab(modelDir_ + "/vocab.json");
     buildReverseVocab();
     config_ = loadConfig(modelDir_ + "/config.json");
@@ -277,6 +280,25 @@ TranslationModel::TranslationModel(const std::string &modelDir) : modelDir_(mode
     sessionOptions_.SetIntraOpNumThreads(1);
     encoderSession_ = std::make_unique<Ort::Session>(env_, (modelDir_ + "/encoder.onnx").c_str(), sessionOptions_);
     decoderSession_ = std::make_unique<Ort::Session>(env_, (modelDir_ + "/decoder.onnx").c_str(), sessionOptions_);
+
+    encoderInfo_.inputNames = {
+        encoderSession_->GetInputNameAllocated(0, allocator_).get(),
+        encoderSession_->GetInputNameAllocated(1, allocator_).get()
+    };
+    encoderInfo_.outputNames = {
+        encoderSession_->GetOutputNameAllocated(0, allocator_).get()
+    };
+    encoderInfo_.updatePointers();
+
+    decoderInfo_.inputNames = {
+        decoderSession_->GetInputNameAllocated(0, allocator_).get(),
+        decoderSession_->GetInputNameAllocated(1, allocator_).get(),
+        decoderSession_->GetInputNameAllocated(2, allocator_).get()
+    };
+    decoderInfo_.outputNames = {
+        decoderSession_->GetOutputNameAllocated(0, allocator_).get()
+    };
+    decoderInfo_.updatePointers();
 }
 
 std::unordered_map<std::string, int> TranslationModel::loadVocab(const std::string &vocabPath) {
@@ -531,13 +553,6 @@ TranslationModel::BatchedInputs TranslationModel::createBatch(const std::vector<
 
 TranslationModel::BatchedEncoderOutput TranslationModel::runBatchedEncoder(const BatchedInputs &batch) {
     try {
-        Ort::AllocatorWithDefaultOptions allocator;
-        auto inputName0 = encoderSession_->GetInputNameAllocated(0, allocator);
-        auto inputName1 = encoderSession_->GetInputNameAllocated(1, allocator);
-        std::vector<const char *> inputNames = {inputName0.get(), inputName1.get()};
-
-        auto outputName0 = encoderSession_->GetOutputNameAllocated(0, allocator);
-        std::vector<const char *> outputNames = {outputName0.get()};
 
         std::vector<int64_t> flatInputIds;
         std::vector<int64_t> flatAttentionMasks;
@@ -554,20 +569,18 @@ TranslationModel::BatchedEncoderOutput TranslationModel::runBatchedEncoder(const
 
         std::vector<int64_t> inputShape = {static_cast<int64_t>(batch.batchSize), static_cast<int64_t>(batch.maxSequenceLength)};
 
-        Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
         Ort::Value inputIdsTensor =
-            Ort::Value::CreateTensor<int64_t>(memoryInfo, flatInputIds.data(), flatInputIds.size(), inputShape.data(), inputShape.size());
+            Ort::Value::CreateTensor<int64_t>(memoryInfo_, flatInputIds.data(), flatInputIds.size(), inputShape.data(), inputShape.size());
 
         Ort::Value attentionMaskTensor =
-            Ort::Value::CreateTensor<int64_t>(memoryInfo, flatAttentionMasks.data(), flatAttentionMasks.size(), inputShape.data(), inputShape.size());
+            Ort::Value::CreateTensor<int64_t>(memoryInfo_, flatAttentionMasks.data(), flatAttentionMasks.size(), inputShape.data(), inputShape.size());
 
         std::vector<Ort::Value> inputTensors;
         inputTensors.push_back(std::move(inputIdsTensor));
         inputTensors.push_back(std::move(attentionMaskTensor));
 
         auto outputTensors = encoderSession_->Run(
-            Ort::RunOptions{nullptr}, inputNames.data(), inputTensors.data(), inputNames.size(), outputNames.data(), outputNames.size());
+            Ort::RunOptions{nullptr}, encoderInfo_.inputNamePtrs.data(), inputTensors.data(), encoderInfo_.inputNamePtrs.size(), encoderInfo_.outputNamePtrs.data(), encoderInfo_.outputNamePtrs.size());
 
         float *outputData = outputTensors[0].GetTensorMutableData<float>();
         auto outputShape = outputTensors[0].GetTensorTypeAndShapeInfo().GetShape();
@@ -682,14 +695,6 @@ std::vector<std::vector<int>> TranslationModel::runBatchedDecoder(const BatchedE
 
 std::vector<float> TranslationModel::runEncoder(const std::vector<int> &tokenIds) {
     try {
-        Ort::AllocatorWithDefaultOptions allocator;
-        auto inputName0 = encoderSession_->GetInputNameAllocated(0, allocator);
-        auto inputName1 = encoderSession_->GetInputNameAllocated(1, allocator);
-        std::vector<const char *> inputNames = {inputName0.get(), inputName1.get()};
-
-        auto outputName0 = encoderSession_->GetOutputNameAllocated(0, allocator);
-        std::vector<const char *> outputNames = {outputName0.get()};
-
         std::vector<int64_t> inputIds;
         std::vector<int64_t> attentionMask;
         inputIds.reserve(tokenIds.size());
@@ -702,20 +707,18 @@ std::vector<float> TranslationModel::runEncoder(const std::vector<int> &tokenIds
 
         std::vector<int64_t> inputShape = {1, static_cast<int64_t>(tokenIds.size())};
 
-        Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
         Ort::Value inputIdsTensor =
-            Ort::Value::CreateTensor<int64_t>(memoryInfo, inputIds.data(), inputIds.size(), inputShape.data(), inputShape.size());
+            Ort::Value::CreateTensor<int64_t>(memoryInfo_, inputIds.data(), inputIds.size(), inputShape.data(), inputShape.size());
 
         Ort::Value attentionMaskTensor =
-            Ort::Value::CreateTensor<int64_t>(memoryInfo, attentionMask.data(), attentionMask.size(), inputShape.data(), inputShape.size());
+            Ort::Value::CreateTensor<int64_t>(memoryInfo_, attentionMask.data(), attentionMask.size(), inputShape.data(), inputShape.size());
 
         std::vector<Ort::Value> inputTensors;
         inputTensors.push_back(std::move(inputIdsTensor));
         inputTensors.push_back(std::move(attentionMaskTensor));
 
         auto outputTensors = encoderSession_->Run(
-            Ort::RunOptions{nullptr}, inputNames.data(), inputTensors.data(), inputNames.size(), outputNames.data(), outputNames.size());
+            Ort::RunOptions{nullptr}, encoderInfo_.inputNamePtrs.data(), inputTensors.data(), encoderInfo_.inputNamePtrs.size(), encoderInfo_.outputNamePtrs.data(), encoderInfo_.outputNamePtrs.size());
 
         float *outputData = outputTensors[0].GetTensorMutableData<float>();
         auto outputShape = outputTensors[0].GetTensorTypeAndShapeInfo().GetShape();
@@ -740,26 +743,15 @@ std::vector<float> TranslationModel::runDecoderStep(const std::vector<int64_t> &
                                                     const std::vector<int64_t> &decoderShape,
                                                     const std::vector<int64_t> &encoderShape) {
     try {
-        Ort::AllocatorWithDefaultOptions allocator;
-        auto inputName0 = decoderSession_->GetInputNameAllocated(0, allocator);
-        auto inputName1 = decoderSession_->GetInputNameAllocated(1, allocator);
-        auto inputName2 = decoderSession_->GetInputNameAllocated(2, allocator);
-        std::vector<const char *> inputNames = {inputName0.get(), inputName1.get(), inputName2.get()};
-
-        auto outputName0 = decoderSession_->GetOutputNameAllocated(0, allocator);
-        std::vector<const char *> outputNames = {outputName0.get()};
-
-        Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
         Ort::Value decoderIdsTensor = Ort::Value::CreateTensor<int64_t>(
-            memoryInfo, const_cast<int64_t *>(decoderInputIds.data()), decoderInputIds.size(), decoderShape.data(), decoderShape.size());
+            memoryInfo_, const_cast<int64_t *>(decoderInputIds.data()), decoderInputIds.size(), decoderShape.data(), decoderShape.size());
 
         Ort::Value encoderTensor = Ort::Value::CreateTensor<float>(
-            memoryInfo, const_cast<float *>(encoderOutput.data()), encoderOutput.size(), encoderShape.data(), encoderShape.size());
+            memoryInfo_, const_cast<float *>(encoderOutput.data()), encoderOutput.size(), encoderShape.data(), encoderShape.size());
 
         std::vector<int64_t> attentionShape = {encoderShape[0], encoderShape[1]};
         Ort::Value attentionTensor = Ort::Value::CreateTensor<int64_t>(
-            memoryInfo, const_cast<int64_t *>(attentionMask.data()), attentionMask.size(), attentionShape.data(), attentionShape.size());
+            memoryInfo_, const_cast<int64_t *>(attentionMask.data()), attentionMask.size(), attentionShape.data(), attentionShape.size());
 
         std::vector<Ort::Value> inputTensors;
         inputTensors.push_back(std::move(decoderIdsTensor));
@@ -767,7 +759,7 @@ std::vector<float> TranslationModel::runDecoderStep(const std::vector<int64_t> &
         inputTensors.push_back(std::move(attentionTensor));
 
         auto outputTensors = decoderSession_->Run(
-            Ort::RunOptions{nullptr}, inputNames.data(), inputTensors.data(), inputNames.size(), outputNames.data(), outputNames.size());
+            Ort::RunOptions{nullptr}, decoderInfo_.inputNamePtrs.data(), inputTensors.data(), decoderInfo_.inputNamePtrs.size(), decoderInfo_.outputNamePtrs.data(), decoderInfo_.outputNamePtrs.size());
 
         float *outputData = outputTensors[0].GetTensorMutableData<float>();
         auto outputShape = outputTensors[0].GetTensorTypeAndShapeInfo().GetShape();
