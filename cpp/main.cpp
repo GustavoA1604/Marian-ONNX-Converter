@@ -691,6 +691,59 @@ void compute_logits_simd(const std::vector<float> &hidden_state,
 }
 #endif
 
+std::vector<std::string> splitIntoSentences(const std::string &text) {
+    std::vector<std::string> sentences;
+    std::string current_sentence;
+    
+    for (size_t i = 0; i < text.length(); ++i) {
+        char c = text[i];
+        current_sentence += c;
+        
+        if (c == '.' || c == '!' || c == '?') {
+            bool is_sentence_end = true;
+            
+            size_t next_pos = i + 1;
+            while (next_pos < text.length() && std::isspace(text[next_pos])) {
+                current_sentence += text[next_pos];
+                next_pos++;
+            }
+            
+            if (is_sentence_end && !current_sentence.empty()) {
+                std::string trimmed = current_sentence;
+                while (!trimmed.empty() && std::isspace(trimmed.front())) {
+                    trimmed = trimmed.substr(1);
+                }
+                while (!trimmed.empty() && std::isspace(trimmed.back())) {
+                    trimmed.pop_back();
+                }
+                
+                if (!trimmed.empty()) {
+                    sentences.push_back(trimmed);
+                }
+                current_sentence.clear();
+                
+                i = next_pos - 1;
+            }
+        }
+    }
+    
+    if (!current_sentence.empty()) {
+        std::string trimmed = current_sentence;
+        while (!trimmed.empty() && std::isspace(trimmed.front())) {
+            trimmed = trimmed.substr(1);
+        }
+        while (!trimmed.empty() && std::isspace(trimmed.back())) {
+            trimmed.pop_back();
+        }
+        
+        if (!trimmed.empty()) {
+            sentences.push_back(trimmed);
+        }
+    }
+    
+    return sentences;
+}
+
 class TranslationModel {
   private:
     // Configuration and data
@@ -842,6 +895,8 @@ class TranslationModel {
         }
     }
 
+
+
     // Private methods for processing
     std::vector<int> tokenize(const std::string &sentence) {
         std::vector<std::string> pieces;
@@ -849,12 +904,6 @@ class TranslationModel {
             std::cerr << "Failed to encode sentence" << std::endl;
             return {};
         }
-
-        std::cout << "\tPieces: ";
-        for (const auto &piece : pieces) {
-            std::cout << "'" << piece << "' ";
-        }
-        std::cout << std::endl;
 
         std::vector<int> ids;
         for (const auto &piece : pieces) {
@@ -878,13 +927,66 @@ class TranslationModel {
             ids.push_back(eos_it->second);
         }
 
-        std::cout << "\tIDs: ";
-        for (const auto &id : ids) {
-            std::cout << id << " ";
-        }
-        std::cout << std::endl;
-
         return ids;
+    }
+
+    struct BatchedInputs {
+        std::vector<std::vector<int64_t>> input_ids;
+        std::vector<std::vector<int64_t>> attention_masks;
+        std::vector<size_t> original_lengths;
+        std::vector<std::string> sentences;
+        size_t batch_size;
+        size_t max_sequence_length;
+    };
+
+    BatchedInputs createBatch(const std::vector<std::string> &sentences) {
+        BatchedInputs batch;
+        batch.sentences = sentences;
+        batch.batch_size = sentences.size();
+        
+        std::vector<std::vector<int>> all_token_ids;
+        size_t max_len = 0;
+        
+        std::cout << "\n--- Batch Tokenization ---" << std::endl;
+        for (size_t i = 0; i < sentences.size(); ++i) {
+            std::cout << "Sentence " << i + 1 << ": \"" << sentences[i] << "\"" << std::endl;
+            
+            std::vector<int> token_ids = tokenize(sentences[i]);
+            if (token_ids.empty()) {
+                throw std::runtime_error("Failed to tokenize sentence: " + sentences[i]);
+            }
+            
+            all_token_ids.push_back(token_ids);
+            max_len = std::max(max_len, token_ids.size());
+            batch.original_lengths.push_back(token_ids.size());
+            
+            std::cout << "\tTokens (" << token_ids.size() << "): ";
+            for (size_t j = 0; j < std::min(token_ids.size(), size_t(10)); ++j) {
+                std::cout << token_ids[j] << " ";
+            }
+            if (token_ids.size() > 10) std::cout << "...";
+            std::cout << std::endl;
+        }
+        
+        batch.max_sequence_length = max_len;
+        std::cout << "Batch size: " << batch.batch_size << ", Max length: " << max_len << std::endl;
+        
+        batch.input_ids.resize(batch.batch_size);
+        batch.attention_masks.resize(batch.batch_size);
+        
+        for (size_t i = 0; i < batch.batch_size; ++i) {
+            const auto &token_ids = all_token_ids[i];
+            
+            batch.input_ids[i].resize(max_len, config_.pad_token_id);
+            batch.attention_masks[i].resize(max_len, 0);
+            
+            for (size_t j = 0; j < token_ids.size(); ++j) {
+                batch.input_ids[i][j] = static_cast<int64_t>(token_ids[j]);
+                batch.attention_masks[i][j] = 1;
+            }
+        }
+        
+        return batch;
     }
 
     std::string detokenize(const std::vector<int> &ids) {
@@ -983,6 +1085,93 @@ class TranslationModel {
         } catch (const std::exception &e) {
             std::cerr << "Encoder error: " << e.what() << std::endl;
             return {};
+        }
+    }
+
+    struct BatchedEncoderOutput {
+        std::vector<float> encoder_outputs;
+        std::vector<int64_t> shape;
+        size_t batch_size;
+        size_t sequence_length;
+        size_t hidden_size;
+    };
+
+    BatchedEncoderOutput runBatchedEncoder(const BatchedInputs &batch) {
+        try {
+            Ort::AllocatorWithDefaultOptions allocator;
+            auto input_name_0 = encoder_session_->GetInputNameAllocated(0, allocator);
+            auto input_name_1 = encoder_session_->GetInputNameAllocated(1, allocator);
+            std::vector<const char *> input_names = {input_name_0.get(), input_name_1.get()};
+
+            auto output_name_0 = encoder_session_->GetOutputNameAllocated(0, allocator);
+            std::vector<const char *> output_names = {output_name_0.get()};
+
+            std::vector<int64_t> flat_input_ids;
+            std::vector<int64_t> flat_attention_masks;
+            
+            flat_input_ids.reserve(batch.batch_size * batch.max_sequence_length);
+            flat_attention_masks.reserve(batch.batch_size * batch.max_sequence_length);
+
+            for (size_t i = 0; i < batch.batch_size; ++i) {
+                for (size_t j = 0; j < batch.max_sequence_length; ++j) {
+                    flat_input_ids.push_back(batch.input_ids[i][j]);
+                    flat_attention_masks.push_back(batch.attention_masks[i][j]);
+                }
+            }
+
+            std::vector<int64_t> input_shape = {
+                static_cast<int64_t>(batch.batch_size),
+                static_cast<int64_t>(batch.max_sequence_length)
+            };
+
+            Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+            Ort::Value input_ids_tensor = Ort::Value::CreateTensor<int64_t>(
+                memory_info, flat_input_ids.data(), flat_input_ids.size(), input_shape.data(), input_shape.size());
+
+            Ort::Value attention_mask_tensor = Ort::Value::CreateTensor<int64_t>(
+                memory_info, flat_attention_masks.data(), flat_attention_masks.size(), input_shape.data(), input_shape.size());
+
+            std::vector<Ort::Value> input_tensors;
+            input_tensors.push_back(std::move(input_ids_tensor));
+            input_tensors.push_back(std::move(attention_mask_tensor));
+
+            std::cout << "\n--- Batched Encoder Inference ---" << std::endl;
+            std::cout << "Input shape: [" << batch.batch_size << ", " << batch.max_sequence_length << "]" << std::endl;
+
+            auto output_tensors = encoder_session_->Run(
+                Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(), input_names.size(), output_names.data(), output_names.size());
+
+            float *output_data = output_tensors[0].GetTensorMutableData<float>();
+            auto output_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+
+            std::cout << "Output shape: [";
+            for (size_t i = 0; i < output_shape.size(); ++i) {
+                std::cout << output_shape[i];
+                if (i < output_shape.size() - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+
+            size_t output_size = 1;
+            for (auto dim : output_shape) {
+                output_size *= dim;
+            }
+
+            BatchedEncoderOutput result;
+            result.encoder_outputs = std::vector<float>(output_data, output_data + output_size);
+            result.shape = output_shape;
+            result.batch_size = output_shape[0];
+            result.sequence_length = output_shape[1];
+            result.hidden_size = output_shape[2];
+
+            return result;
+
+        } catch (const Ort::Exception &e) {
+            std::cerr << "Batched Encoder ONNX Runtime error: " << e.what() << std::endl;
+            throw;
+        } catch (const std::exception &e) {
+            std::cerr << "Batched Encoder error: " << e.what() << std::endl;
+            throw;
         }
     }
 
@@ -1115,6 +1304,104 @@ class TranslationModel {
         return generated_tokens;
     }
 
+    std::vector<std::vector<int>> runBatchedDecoder(const BatchedEncoderOutput &encoder_output, const BatchedInputs &batch_inputs) {
+        std::cout << "\n--- Batched Decoder Generation ---" << std::endl;
+        
+        size_t batch_size = encoder_output.batch_size;
+        std::vector<std::vector<int>> all_generated_tokens(batch_size);
+        std::vector<std::vector<int64_t>> all_decoder_input_ids(batch_size);
+        std::vector<bool> finished(batch_size, false);
+        
+        for (size_t i = 0; i < batch_size; ++i) {
+            all_generated_tokens[i].push_back(config_.decoder_start_token_id);
+            all_decoder_input_ids[i] = {static_cast<int64_t>(config_.decoder_start_token_id)};
+        }
+
+        for (int step = 0; step < config_.max_length; ++step) {
+            bool all_finished = true;
+            for (size_t i = 0; i < batch_size; ++i) {
+                if (!finished[i]) {
+                    all_finished = false;
+                    break;
+                }
+            }
+            if (all_finished) break;
+
+            for (size_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+                if (finished[batch_idx]) continue;
+
+                size_t encoder_seq_len = batch_inputs.original_lengths[batch_idx];
+                size_t encoder_start_idx = batch_idx * encoder_output.sequence_length * encoder_output.hidden_size;
+                
+                std::vector<float> single_encoder_output;
+                single_encoder_output.reserve(encoder_seq_len * encoder_output.hidden_size);
+                
+                for (size_t seq_pos = 0; seq_pos < encoder_seq_len; ++seq_pos) {
+                    size_t pos_start = encoder_start_idx + seq_pos * encoder_output.hidden_size;
+                    for (size_t h = 0; h < encoder_output.hidden_size; ++h) {
+                        single_encoder_output.push_back(encoder_output.encoder_outputs[pos_start + h]);
+                    }
+                }
+
+                std::vector<int64_t> attention_mask;
+                attention_mask.reserve(encoder_seq_len);
+                for (size_t i = 0; i < encoder_seq_len; ++i) {
+                    attention_mask.push_back(1);
+                }
+
+                std::vector<int64_t> decoder_shape = {1, static_cast<int64_t>(all_decoder_input_ids[batch_idx].size())};
+                std::vector<int64_t> encoder_shape = {1, static_cast<int64_t>(encoder_seq_len), static_cast<int64_t>(encoder_output.hidden_size)};
+
+                std::vector<float> decoder_output = runDecoderStep(
+                    all_decoder_input_ids[batch_idx], 
+                    single_encoder_output, 
+                    attention_mask, 
+                    decoder_shape, 
+                    encoder_shape
+                );
+
+                if (decoder_output.empty()) {
+                    std::cerr << "Decoder step failed for batch " << batch_idx << "!" << std::endl;
+                    finished[batch_idx] = true;
+                    continue;
+                }
+
+                int seq_len = all_decoder_input_ids[batch_idx].size();
+                std::vector<float> last_hidden(encoder_output.hidden_size);
+                for (size_t i = 0; i < encoder_output.hidden_size; ++i) {
+                    last_hidden[i] = decoder_output[(seq_len - 1) * encoder_output.hidden_size + i];
+                }
+
+                std::vector<float> logits(config_.vocab_size, 0.0f);
+#ifdef USE_SIMD
+                compute_logits_simd(last_hidden, *lm_weights_, *lm_bias_, logits, config_.vocab_size, encoder_output.hidden_size);
+#else
+                compute_logits_optimized(last_hidden, *lm_weights_, *lm_bias_, logits, config_.vocab_size, encoder_output.hidden_size);
+#endif
+
+                // Find argmax (greedy search)
+                int next_token_id = 0;
+                float max_logit = logits[0];
+                for (int i = 1; i < config_.vocab_size; ++i) {
+                    if (logits[i] > max_logit) {
+                        max_logit = logits[i];
+                        next_token_id = i;
+                    }
+                }
+
+                all_generated_tokens[batch_idx].push_back(next_token_id);
+                all_decoder_input_ids[batch_idx].push_back(static_cast<int64_t>(next_token_id));
+
+                if (next_token_id == config_.eos_token_id) {
+                    finished[batch_idx] = true;
+                }
+            }
+        }
+
+        std::cout << "Batched generation completed!" << std::endl;
+        return all_generated_tokens;
+    }
+
   public:
     TranslationModel(const std::string &model_dir) : model_dir_(model_dir), env_(ORT_LOGGING_LEVEL_WARNING, "MarianTranslationModel") {
 
@@ -1154,88 +1441,122 @@ class TranslationModel {
         std::cout << "Translation model loaded successfully!" << std::endl;
     }
 
-    std::string translate(const std::string &input_sentence) {
-        std::cout << "\n=== TRANSLATION INFERENCE ===" << std::endl;
-        std::cout << "Input sentence: \"" << input_sentence << "\"" << std::endl;
+    std::vector<std::string> translate(const std::vector<std::string> &sentences) {
+        std::cout << "\n=== BATCH TRANSLATION INFERENCE ===" << std::endl;
+        
+        if (sentences.empty()) {
+            throw std::runtime_error("No sentences provided for translation");
+        }
+        
+        std::cout << "Processing " << sentences.size() << " sentence(s):" << std::endl;
+        for (size_t i = 0; i < sentences.size(); ++i) {
+            std::cout << "  " << i + 1 << ": \"" << sentences[i] << "\"" << std::endl;
+        }
 
         auto inference_start = std::chrono::high_resolution_clock::now();
 
-        // Step 1: Tokenization
-        std::cout << "\n--- Tokenization ---" << std::endl;
-        std::vector<int> input_ids = tokenize(input_sentence);
-        if (input_ids.empty()) {
-            throw std::runtime_error("Failed to tokenize sentence");
-        }
+        // Step 1: Create batch with tokenization and padding
+        BatchedInputs batch = createBatch(sentences);
 
-        std::string decoded_input = detokenize(input_ids);
-        if (input_sentence != decoded_input) {
-            throw std::runtime_error("Input sentence does not match decoded text");
-        }
-
-        // Step 2: Encoder inference
-        std::cout << "\n--- Encoder Inference ---" << std::endl;
+        // Step 2: Batched encoder inference
         auto encoder_start = std::chrono::high_resolution_clock::now();
-
-        std::vector<float> encoder_output = runEncoder(input_ids);
-        if (encoder_output.empty()) {
-            throw std::runtime_error("Encoder inference failed");
-        }
-
+        BatchedEncoderOutput encoder_output = runBatchedEncoder(batch);
         auto encoder_end = std::chrono::high_resolution_clock::now();
         double encoder_time = std::chrono::duration<double, std::milli>(encoder_end - encoder_start).count();
-        std::cout << "Encoder completed in " << encoder_time << " ms" << std::endl;
+        std::cout << "Batched encoder completed in " << encoder_time << " ms" << std::endl;
 
-        // Step 3: Decoder generation
-        std::cout << "\n--- Decoder Generation ---" << std::endl;
+        // Step 3: Batched decoder generation
         auto decoder_start = std::chrono::high_resolution_clock::now();
-
-        std::vector<int64_t> attention_mask;
-        attention_mask.reserve(input_ids.size());
-        for (size_t i = 0; i < input_ids.size(); ++i) {
-            attention_mask.push_back(1);
-        }
-
-        std::vector<int> generated_tokens = runDecoder(encoder_output, attention_mask);
-
+        std::vector<std::vector<int>> all_generated_tokens = runBatchedDecoder(encoder_output, batch);
         auto decoder_end = std::chrono::high_resolution_clock::now();
         auto inference_end = std::chrono::high_resolution_clock::now();
 
         double decoder_time = std::chrono::duration<double, std::milli>(decoder_end - decoder_start).count();
         double total_inference_time = std::chrono::duration<double, std::milli>(inference_end - inference_start).count();
-        double tokens_per_second = (generated_tokens.size() - 1) / (total_inference_time / 1000.0);
 
-        // Step 4: Detokenization
+        // Step 4: Detokenize all results
         std::cout << "\n--- Final Results ---" << std::endl;
-        std::cout << "Generated token IDs: ";
-        for (int id : generated_tokens) {
-            std::cout << id << " ";
-        }
-        std::cout << std::endl;
+        std::vector<std::string> translated_sentences;
+        translated_sentences.reserve(sentences.size());
 
-        std::string final_translation = detokenize(generated_tokens);
-        std::cout << "Final translation: " << final_translation << std::endl;
+        for (size_t i = 0; i < sentences.size(); ++i) {
+            std::cout << "\nSentence " << i + 1 << ":" << std::endl;
+            std::cout << "  Original: \"" << sentences[i] << "\"" << std::endl;
+            
+            std::cout << "  Generated tokens: ";
+            for (int id : all_generated_tokens[i]) {
+                std::cout << id << " ";
+            }
+            std::cout << std::endl;
+
+            std::string translation = detokenize(all_generated_tokens[i]);
+            translated_sentences.push_back(translation);
+            std::cout << "  Translation: \"" << translation << "\"" << std::endl;
+        }
+
+        // Calculate performance metrics
+        size_t total_generated_tokens = 0;
+        for (const auto &tokens : all_generated_tokens) {
+            total_generated_tokens += tokens.size() - 1; // Subtract start token
+        }
+
+        double tokens_per_second = total_generated_tokens / (total_inference_time / 1000.0);
 
         std::cout << "\n=== PERFORMANCE METRICS ===" << std::endl;
+        std::cout << "Sentences processed: " << sentences.size() << std::endl;
         std::cout << "Encoder time: " << encoder_time << " ms" << std::endl;
         std::cout << "Decoder time: " << decoder_time << " ms" << std::endl;
         std::cout << "Total inference time: " << total_inference_time << " ms" << std::endl;
-        std::cout << "Generated tokens: " << (generated_tokens.size() - 1) << std::endl;
+        std::cout << "Total generated tokens: " << total_generated_tokens << std::endl;
         std::cout << "Tokens per second: " << tokens_per_second << std::endl;
+        std::cout << "Sentences per second: " << sentences.size() / (total_inference_time / 1000.0) << std::endl;
 
-        return final_translation;
+        return translated_sentences;
     }
 };
 
 int main(int argc, char *argv[]) {
     try {
-        std::string sentence = "This is a test";
+        std::string input_text = "This is a test. How are you today? I hope everything is going well!";
         if (argc > 1 && strlen(argv[1]) > 0) {
-            sentence = argv[1];
+            input_text = argv[1];
         }
 
         const std::string model_dir = "../outs/";
         TranslationModel model(model_dir);
-        std::string translation = model.translate(sentence);
+        
+        std::cout << "\n=== TRANSLATION MODEL LOADED ===" << std::endl;
+        std::cout << "Usage: " << argv[0] << " \"<text with multiple sentences>\"" << std::endl;
+        std::cout << "Note: The model will automatically split text on '.', '!', and '?' and process each sentence in a batch." << std::endl;
+        
+        // Step 1: Split input text into sentences
+        std::cout << "\n=== SENTENCE SPLITTING ===" << std::endl;
+        std::cout << "Input text: \"" << input_text << "\"" << std::endl;
+        
+        std::vector<std::string> sentences = splitIntoSentences(input_text);
+        
+        if (sentences.empty()) {
+            throw std::runtime_error("No sentences found in input text");
+        }
+        
+        std::cout << "Found " << sentences.size() << " sentence(s):" << std::endl;
+        for (size_t i = 0; i < sentences.size(); ++i) {
+            std::cout << "  " << i + 1 << ": \"" << sentences[i] << "\"" << std::endl;
+        }
+        
+        // Step 2: Translate sentences
+        std::vector<std::string> translations = model.translate(sentences);
+        
+        // Step 3: Combine translated sentences
+        std::cout << "\n=== COMBINING TRANSLATIONS ===" << std::endl;
+        std::string final_result;
+        for (size_t i = 0; i < translations.size(); ++i) {
+            if (i > 0) final_result += " ";
+            final_result += translations[i];
+        }
+        
+        std::cout << "Final combined translation: \"" << final_result << "\"" << std::endl;
+        
         return 0;
 
     } catch (const std::exception &e) {
