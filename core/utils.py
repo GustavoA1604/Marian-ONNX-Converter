@@ -65,12 +65,12 @@ def create_marian_encoder_decoder(model_path: str, outdir: str):
     marian_encoder = MarianEncoder(encoder).eval()
     marian_decoder = MarianDecoder(decoder).eval()
 
-    torch.save(model.model.shared.weight, os.path.join(outdir, 'lm_weight.bin'))
-    torch.save(model.final_logits_bias, os.path.join(outdir, 'lm_bias.bin'))
+    # torch.save(model.model.shared.weight, os.path.join(outdir, 'lm_weight.bin'))
+    # torch.save(model.final_logits_bias, os.path.join(outdir, 'lm_bias.bin'))
     
     print("Saving raw binary weights for C++ compatibility...")
-    save_tensor_as_raw_binary(model.model.shared.weight, os.path.join(outdir, 'lm_weight_raw.bin'))
-    save_tensor_as_raw_binary(model.final_logits_bias, os.path.join(outdir, 'lm_bias_raw.bin'))
+    save_tensor_as_raw_binary(model.model.shared.weight, os.path.join(outdir, 'lm_weight.bin'))
+    save_tensor_as_raw_binary(model.final_logits_bias, os.path.join(outdir, 'lm_bias.bin'))
 
     for file in ['config.json', 'source.spm', 'target.spm', 'tokenizer_config.json', 'vocab.json']:
         shutil.copyfile(os.path.join(model_path, file), os.path.join(outdir, file))
